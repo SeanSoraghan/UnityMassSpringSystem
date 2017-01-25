@@ -1,0 +1,207 @@
+﻿/**
+ * Copyright 2017 Sean Soraghan
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated 
+ * documentation files (the "Software"), to deal in the Software without restriction, including without 
+ * limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of 
+ * the Software, and to permit persons to whom the Software is furnished to do so, subject to the following 
+ * conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in all copies or substantial 
+ * portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT 
+ * LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO 
+ * EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER 
+ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE 
+ * USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+#pragma kernel CSMainPos
+#pragma kernel CSMainVel
+#pragma target 4.0
+
+#define thread_group_size_x 4
+#define thread_group_size_y 4
+
+//================================================================================================
+// Summary
+//================================================================================================
+/**
+ * This shader implements a mass spring model. There are two main kernels: CSMainPos and CSMainVel,
+ * for position and velocity respectively. The position kernel is straightforward: it gets the index
+ * of the current vertex in the overall grid and updates its position according to it velocity.
+ *
+ * The velocity kernel uses all of the neighbouring points in the grid as well as the external forces
+ * acting on the grid in order to calculate the current acceleration at a given vertex and updates
+ * the velocity of that vertex according to the acceleration.
+ */
+
+/** The position, velocity and force structs hold 3D positions, velocity and force vectors for individual points on the grid. 
+ */
+struct Position
+{
+    float3 pos;
+};
+
+struct Velocity
+{
+    float3 vel;
+};
+
+struct Force
+{
+    float3 force;
+};
+
+/** The Neighbours struct holds the positions of the 12 surrounding neighbours of an individual point on the grid. 
+ *  These are: north, north-east, east, south-east, south, south-west, west, north-west, north-bend, east-bend, south-bend, west-bend.
+ *  The bend neighbours implement resistance to bending in the grid. They are 2 grid spaces away on the x (west bend and east bend)
+ *  and y (north bend and south bend) axes.
+ */
+struct Neighbours
+{
+    float2 neighbours[12];
+};
+
+/** The properties struct holds the physical properties of the grid
+  *
+  * The mass of individual mass points in the mass spring model.
+  * Increasing this will make the mass points more resistive to
+  * the springs in the model, but will also reduce their velocity.  
+  *
+  * The level of damping in the system. Increasing this value
+  *  will cause the system to return to a more 'stable' state quicker,
+  *  and will reduce the propagation of forces throughout the grid.  
+  *  
+  * The stiffness of the spings in the grid. Increasing this will
+  *  cause mass points to 'rebound' with higher velocity, and will
+  *  also decrease the time taken for the system to return to a
+  *  'stable' state.
+  *
+  * The lenght of the springs in the grid. This defines how far
+  *  each mass unit is at a resting state.
+  */
+struct Properties
+{
+    float mass;
+    float damping;
+    float springStiffness;
+    float springLength;
+};
+
+struct DeltaTime
+{
+    float deltaTime;
+};
+
+RWStructuredBuffer<Position>   posBuffer;
+RWStructuredBuffer<Velocity>   velBuffer;
+RWStructuredBuffer<Force>      externalForcesBuffer;
+RWStructuredBuffer<Neighbours> neighboursBuffer;
+RWStructuredBuffer<Properties> propertiesBuffer;
+RWStructuredBuffer<DeltaTime>  deltaTimeBuffer;
+
+/** Get the force exerted on a grid point at index idx by its neighbour at index nIdx.
+  */
+const float3 getForceForNeighbour (const int idx, const int2 nIdx, const float stiffness, const float springLength, const float dampingFactor)
+{
+    float3 d      = posBuffer[nIdx.x * nIdx.y].pos - posBuffer[idx].pos;
+    float dLength = length(d);
+    // avoid division by 0.
+    float divisor = dLength + ((float) (dLength == 0.0f));
+    float3 dN     = d / (divisor == 0.0f ? 1.0f : divisor);
+    float3 force  = stiffness * (d - springLength * dN) + dampingFactor * (velBuffer[nIdx.x].vel - velBuffer[idx.x].vel);
+    // nIdx.y is a flag indicating whether that index exists within the grid bounds (1.0f or 0.0f).
+    return force *  nIdx.y;
+}
+
+[numthreads (thread_group_size_x, thread_group_size_y, 1)]
+void CSMainVel (uint3 id : SV_DispatchThreadID)
+{
+    /** Our compute shader runs the same kernels in parallel on mutliple blocks of our
+     *  mass spring grid. These blocks are of dimensions gX by gY,
+     *  and there are thread_group_size_x blocks along the x dimension of our grid and
+     *  thread_group_size_y along the Y dimension.
+     *  
+     *  These values MUST be identical to the gridUnitSideX and gridUnitSideY values in the 
+     *  MassSpringSystem script.
+     */
+
+	//number of points per side, per thread.
+    const int gX = 15;
+    const int gY = 7;
+    //grid side resolution
+    const int sX = gX * thread_group_size_x;
+    const int sY = gY * thread_group_size_y;
+
+    const float  mass          = propertiesBuffer[0].mass;
+    const float  damping       = propertiesBuffer[0].damping;
+    const float  stiffness     = propertiesBuffer[0].springStiffness;
+    const float  springLength  = propertiesBuffer[0].springLength;
+
+    //get the index of the vertex in the overall grid.
+    const int idx    = id.x + id.y * thread_group_size_x * gX;
+    //max index is the number of vertices in our grid.
+    const int maxIdx = sX * sY;
+
+    int2 northNeighbour     = neighboursBuffer[idx].neighbours [0];
+    int2 northEastNeighbour = neighboursBuffer[idx].neighbours [1];
+    int2 eastNeighbour      = neighboursBuffer[idx].neighbours [2];
+    int2 southEastNeighbour = neighboursBuffer[idx].neighbours [3];
+    int2 southNeighbour     = neighboursBuffer[idx].neighbours [4];
+    int2 southWestNeighbour = neighboursBuffer[idx].neighbours [5];
+    int2 westNeighbour      = neighboursBuffer[idx].neighbours [6];
+    int2 northWestNeighbour = neighboursBuffer[idx].neighbours [7];
+
+    int2 northBendNeighbour = neighboursBuffer[idx].neighbours [8];
+    int2 eastBendNeighbour  = neighboursBuffer[idx].neighbours [9];
+    int2 southBendNeighbour = neighboursBuffer[idx].neighbours [10];
+    int2 westBendNeighbour  = neighboursBuffer[idx].neighbours [11];
+
+    /** Our grid is structured to have rigid, non-moving edges.
+     */
+    const float notEdge = (float) (northBendNeighbour.y && eastBendNeighbour.y && westBendNeighbour.y && southBendNeighbour.y);
+    
+    const float3 northForce      = getForceForNeighbour (idx, northNeighbour,     stiffness, springLength, damping);
+    const float3 northEastForce  = getForceForNeighbour (idx, northEastNeighbour, stiffness, springLength, damping);
+    const float3 eastForce       = getForceForNeighbour (idx, eastNeighbour,      stiffness, springLength, damping);
+    const float3 southEastForce  = getForceForNeighbour (idx, southEastNeighbour, stiffness, springLength, damping);
+    const float3 southForce      = getForceForNeighbour (idx, southNeighbour,     stiffness, springLength, damping);
+    const float3 southWestForce  = getForceForNeighbour (idx, southWestNeighbour, stiffness, springLength, damping);
+    const float3 westForce       = getForceForNeighbour (idx, westNeighbour,      stiffness, springLength, damping);
+    const float3 northWestForce  = getForceForNeighbour (idx, northWestNeighbour, stiffness, springLength, damping);
+
+    const float3 northBendForce  = getForceForNeighbour (idx, northBendNeighbour, stiffness, springLength, damping);
+    const float3 eastBendForce   = getForceForNeighbour (idx, eastBendNeighbour,  stiffness, springLength, damping);
+    const float3 westBendForce   = getForceForNeighbour (idx, southBendNeighbour, stiffness, springLength, damping);
+    const float3 southBendForce  = getForceForNeighbour (idx, westBendNeighbour,  stiffness, springLength, damping);
+
+    const float3 internalForce   = (northForce + eastForce + westForce + southForce + 
+                                    northEastForce + northWestForce + southEastForce + southWestForce +
+                                    northBendForce + eastBendForce + westBendForce + southBendForce);
+    //Add the external forces from the external forces buffer to the internal neighbour forces.
+    const float3 force           = internalForce + externalForcesBuffer[idx].force;
+    //m = fa, a = f/m
+    const float3 acceleration    = force / (mass == 0.0f ? 1.0f : mass);
+    float        delta           = deltaTimeBuffer[0].deltaTime;
+    //notEdge acts like a boolean flag here, zeroing out any vertices that exist along the edges.
+    const float3 vDelta = notEdge * acceleration * delta;
+    float3 newVel = velBuffer[idx].vel + vDelta;
+    velBuffer[idx].vel = newVel;
+}
+
+[numthreads (thread_group_size_x, thread_group_size_y, 1)]
+void CSMainPos (uint3 id : SV_DispatchThreadID)
+{
+	//number of points per side, per thread.
+    const int gX   = 15;
+    const int gY   = 7;
+    //index y, x, in order to convert to unity space
+    const int idx = id.x + id.y * thread_group_size_x * gX;
+
+    //calculate new positions given new velocities
+    const float delta  = deltaTimeBuffer[0].deltaTime;
+    externalForcesBuffer[idx].force = float3 (0.0f, 0.0f, 0.0f);
+	posBuffer[idx].pos = posBuffer[idx].pos + (velBuffer[idx].vel * delta);
+}
